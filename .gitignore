@@ -1,0 +1,6 @@
+/target
+/vendor
+/model/*.onnx
+*.wav
+*.srt
+__pycache__/
