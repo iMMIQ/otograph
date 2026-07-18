@@ -43,6 +43,9 @@ pub struct ServeSpec {
     pub max_model_len: u32,
     /// vLLM admission cap (`--max-num-seqs`); `None` = vLLM default (256).
     pub max_num_seqs: Option<u32>,
+    /// Host-side multimodal preprocessing cache size in GiB. Transcription
+    /// segments are unique, so the default disables this 4 GiB vLLM cache.
+    pub mm_processor_cache_gb: f32,
     /// Pass `--enforce-eager` (no torch.compile/CUDA graphs). ASR wants eager:
     /// graph capture is pathological (~121s) on this Jetson.
     pub enforce_eager: bool,
@@ -170,6 +173,8 @@ async fn launch_once(spec: &ServeSpec) -> Result<ContainerGuard> {
         spec.max_model_len.to_string(),
         "--gpu-memory-utilization".into(),
         spec.gpu_memory_utilization.to_string(),
+        "--mm-processor-cache-gb".into(),
+        spec.mm_processor_cache_gb.to_string(),
         "--enable-prefix-caching".into(),
     ]);
     if spec.enforce_eager {

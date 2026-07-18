@@ -47,7 +47,7 @@ struct Cli {
     lang_from_name: bool,
 
     /// Concurrency: max simultaneous ASR requests per file.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 96)]
     concurrency: usize,
 
     /// VAD speech probability threshold.
@@ -126,16 +126,20 @@ struct Cli {
     kv_cache_dtype: Option<String>,
 
     /// gpu-memory-utilization for vLLM.
-    #[arg(long, default_value_t = 0.30, env = "OTOGRAPH_GPU_MEMORY_UTILIZATION")]
+    #[arg(long, default_value_t = 0.03, env = "OTOGRAPH_GPU_MEMORY_UTILIZATION")]
     gpu_memory_utilization: f32,
 
     /// max-model-len for vLLM.
-    #[arg(long, default_value_t = 8192, env = "OTOGRAPH_MAX_MODEL_LEN")]
+    #[arg(long, default_value_t = 512, env = "OTOGRAPH_MAX_MODEL_LEN")]
     max_model_len: u32,
 
-    /// max-num-seqs (vLLM admission cap); omit for the vLLM default (256).
-    #[arg(long, env = "OTOGRAPH_MAX_NUM_SEQS")]
+    /// max-num-seqs (vLLM admission cap).
+    #[arg(long, default_value = "128", env = "OTOGRAPH_MAX_NUM_SEQS")]
     max_num_seqs: Option<u32>,
+
+    /// GiB reserved for vLLM's multimodal processor cache; ASR segments are unique.
+    #[arg(long, default_value_t = 0.0, env = "OTOGRAPH_MM_PROCESSOR_CACHE_GB")]
+    mm_processor_cache_gb: f32,
 
     /// Seconds to wait for the container to become healthy (cold start).
     #[arg(long, default_value_t = 600, env = "OTOGRAPH_HEALTH_TIMEOUT")]
@@ -191,6 +195,7 @@ async fn main() -> Result<()> {
         gpu_memory_utilization: cli.gpu_memory_utilization,
         max_model_len: cli.max_model_len,
         max_num_seqs: cli.max_num_seqs,
+        mm_processor_cache_gb: cli.mm_processor_cache_gb,
         // ASR: graph capture is pathological (~121s) on this Jetson → always eager.
         enforce_eager: true,
         health_timeout: cli.health_timeout,

@@ -119,7 +119,7 @@ Key options (`otograph --help` for all):
 | `--model` | `/models/Qwen3-ASR-1.7B` | served model name |
 | `--language` | *(auto)* | `zh`/`ja`/`en`/… **Pass explicitly** — server auto-detect is unreliable. |
 | `--lang-from-name` | off | parse language from each filename |
-| `--concurrency` | `8` | max simultaneous ASR requests per file (server likes 64–128) |
+| `--concurrency` | `96` | max simultaneous ASR requests per file; tuned with the server defaults below |
 | `--max-completion-tokens` | `200` | bounds ASR decode length |
 | `--vad-threshold` | `0.5` | speech probability threshold |
 | `--vad-min-silence-ms` | `300` | silence that splits two segments |
@@ -161,15 +161,22 @@ docker run -d --runtime=nvidia --name qwen3-asr-1.7b \
   -v /path/to/Qwen3-ASR-1.7B:/models/Qwen3-ASR-1.7B:ro \
   -p 8002:8000 --shm-size 1g --entrypoint vllm qwen3-asr-vllm:audio \
   serve /models/Qwen3-ASR-1.7B --host 0.0.0.0 --port 8000 \
-  --dtype bfloat16 --max-model-len 8192 --gpu-memory-utilization 0.30 \
-  --max-num-seqs 256 --enable-prefix-caching --enforce-eager
+  --dtype bfloat16 --max-model-len 512 --gpu-memory-utilization 0.03 \
+  --max-num-seqs 128 --mm-processor-cache-gb 0 \
+  --enable-prefix-caching --enforce-eager
 ```
 
 - **`--enforce-eager`** is correct for this encoder-decoder model (FULL cuda
   graph capture is pathological: ~121 s/graph). PIECEWISE graphs give ~0 % gain
   because the workload is GPU-compute-bound.
-- **Throughput** is GPU-compute-bound (~294 audio-s/s at concurrency 128);
-  concurrency is the lever — raise `--concurrency` for batch directories.
+- **`--concurrency=96`** is the latency/throughput knee on this Jetson. On a
+  fixed 382-clip workload it sustained 34.19 requests/s with 2.38 s mean
+  request latency. Concurrency 128 gained only 4.2% throughput (35.62
+  requests/s) while increasing mean latency by 24% to 2.95 s.
+- **The low-memory server defaults are deliberate.** A 0.03 GPU-memory budget
+  provides a 1.48 GiB / 13,888-token KV cache for this short-context endpoint,
+  down from 18.01 GiB at 0.30. Disabling the default 4 GiB multimodal processor
+  cache avoids retaining one-off audio preprocessing results.
 - **`max_completion_tokens`** must be bounded — without it the server runs away
   on non-speech (no stop tokens on the transcription path). 200 is plenty per
   segment.

@@ -30,7 +30,7 @@ impl AsrClient {
         let http = Client::builder()
             .timeout(Duration::from_secs(600))
             .pool_idle_timeout(Duration::from_secs(30))
-            .pool_max_idle_per_host(64)
+            .pool_max_idle_per_host(128)
             .build()?;
         let url = format!("{}/v1/audio/transcriptions", server.trim_end_matches('/'));
         Ok(Self {
