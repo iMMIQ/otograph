@@ -4,7 +4,7 @@
 //! The whole forward (STFT -> 4 Conv1d -> LSTM cell -> FC) is one
 //! cooperatively-launched kernel (`vad_staged`, grid=32, shared-mem weight
 //! staging + grid-sync between stages) compiled from `vad_assets.rs`. Measured
-//! on this Jetson Orin: ~47 us/window p50 (min ~42 us) — down from ~70 us for
+//! on this Jetson Orin: 19.5-19.7 us/window end-to-end p50, down from ~70 us for
 //! the previous 7-kernel chain.
 //!
 //! Why fuse to one kernel: on this Jetson the per-launch dispatch floor is ~5 us
@@ -12,10 +12,10 @@
 //! 7-kernel graph == 7 individual launches). The 7-kernel chain was ~70 us Rust
 //! (35 us dispatch + 10 us compute + memcpy). One cooperative launch collapses
 //! the dispatches; shared-mem staging keeps the compute near the 7-kernel's; the
-//! `xpad` input is zero-copy (mapped host memory) so there is no per-window
-//! cuMemcpyHtoD. LSTM state (h, c) stays resident and is updated in place by the
-//! kernel (it reads c, not h; Kz reads h before the gates write it), so there is
-//! no ping-pong and the kernelParams are built once at load.
+//! `xpad` input and `prob` output use mapped host memory, so there are no
+//! per-window CUDA copies. LSTM state (h, c) stays resident and is updated in
+//! place by the kernel (it reads c, not h; Kz reads h before the gates write
+//! it), so there is no ping-pong and the kernelParams are built once at load.
 //!
 //! The `speech_timestamps` state machine below is a line-by-line port of the
 //! official `silero_vad` `get_speech_timestamps`; only the per-window `forward`
@@ -24,6 +24,7 @@
 use anyhow::{anyhow, Context, Result};
 use libloading::Library;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::vad_assets::{KERNELS, WEIGHTS, KSpec, Slot};
 
@@ -65,7 +66,6 @@ struct Cuda {
     mem_host_get_device_ptr: unsafe extern "C" fn(*mut Cudeviceptr, *mut c_void, c_uint) -> Curesult,
     mem_free_host: unsafe extern "C" fn(*mut c_void) -> Curesult,
     memcpy_h2d: unsafe extern "C" fn(Cudeviceptr, *const c_void, usize) -> Curesult,
-    memcpy_d2h: unsafe extern "C" fn(*mut c_void, Cudeviceptr, usize) -> Curesult,
     launch_cooperative: unsafe extern "C" fn(
         Cufunction, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint,
         Custream, *mut *mut c_void, *mut *mut c_void,
@@ -119,7 +119,6 @@ impl Cuda {
             );
             let mem_free_host = sym!("cuMemFreeHost", unsafe extern "C" fn(*mut c_void) -> Curesult);
             let memcpy_h2d = sym!("cuMemcpyHtoD_v2", unsafe extern "C" fn(Cudeviceptr, *const c_void, usize) -> Curesult);
-            let memcpy_d2h = sym!("cuMemcpyDtoH_v2", unsafe extern "C" fn(*mut c_void, Cudeviceptr, usize) -> Curesult);
             let launch_cooperative = sym!(
                 "cuLaunchCooperativeKernel",
                 unsafe extern "C" fn(
@@ -131,7 +130,7 @@ impl Cuda {
                 _lib: lib, init, device_get, primary_ctx_retain, ctx_set_current,
                 library_load_data, library_get_kernel, memset_d32, mem_alloc, mem_free,
                 mem_host_alloc, mem_host_get_device_ptr, mem_free_host,
-                memcpy_h2d, memcpy_d2h, launch_cooperative,
+                memcpy_h2d, launch_cooperative,
             })
         }
     }
@@ -178,7 +177,8 @@ fn slot_nelems(s: Slot) -> usize {
         E2G => 64 * 3,
         FeatG => 128,
         ZG => 512,
-        Prob => 1,
+        Prob | Ready | Done | NWindows => 1,
+        XpadCache => XPAD_LEN,
         H | C => 128,
         // weights: sized from their embedded blob at load
         Basis | Ew0 | Ew1 | Ew2 | Ew3 | Eb0 | Eb1 | Eb2 | Eb3
@@ -201,6 +201,8 @@ pub struct VadModel {
     slot_bytes: Vec<[u8; 8]>,
     kparams: Vec<*mut c_void>,
     xpad_host: *mut f32,             // mapped host buffer the GPU reads (zero-copy input)
+    prob_host: *mut f32,             // mapped host buffer the GPU writes (zero-copy output)
+    ctrl_host: *mut i32,             // ready, done, window-count handshake
     context: Vec<f32>,               // 64-sample rolling context (host)
     _lib: Culibrary,                 // keep the loaded cubin library alive
     bench: bool,
@@ -208,7 +210,7 @@ pub struct VadModel {
 
     bench_h2d: u64,
     bench_launch: u64,
-    bench_d2h: u64,
+    bench_wait: u64,
 }
 
 // VadModel is moved across threads by spawn_blocking; the handles are plain
@@ -269,7 +271,8 @@ impl VadModel {
         let xpad_host: *mut f32;
         {
             let mut raw: *mut c_void = std::ptr::null_mut();
-            // CU_MEMHOSTALLOC_DEVICEMAP(2) | CU_MEMHOSTALLOC_WRITE_COMBINED(4)
+            // Write-combined mapped input avoids stale CPU cache lines when the
+            // persistent kernel consumes a newly published window.
             unsafe {
                 cuerr((cuda.mem_host_alloc)(&mut raw, XPAD_LEN * 4, 6), "cuMemHostAlloc xpad")?;
             }
@@ -282,8 +285,40 @@ impl VadModel {
             }
             ptr[slot_index(Slot::Xpad)] = xpad_dev;
         }
+        let prob_host: *mut f32;
+        {
+            let mut raw: *mut c_void = std::ptr::null_mut();
+            unsafe {
+                cuerr((cuda.mem_host_alloc)(&mut raw, 4, 2), "cuMemHostAlloc prob")?;
+            }
+            prob_host = raw as *mut f32;
+            unsafe { *prob_host = 0.0; }
+            let mut prob_dev: Cudeviceptr = 0;
+            unsafe {
+                cuerr((cuda.mem_host_get_device_ptr)(&mut prob_dev, raw, 0), "cuMemHostGetDevicePointer prob")?;
+            }
+            ptr[slot_index(Slot::Prob)] = prob_dev;
+        }
+        let ctrl_host: *mut i32;
+        {
+            let mut raw: *mut c_void = std::ptr::null_mut();
+            unsafe {
+                cuerr((cuda.mem_host_alloc)(&mut raw, 3 * 4, 2), "cuMemHostAlloc control")?;
+            }
+            ctrl_host = raw as *mut i32;
+            unsafe {
+                std::ptr::write_bytes(ctrl_host, 0, 3);
+            }
+            let mut ctrl_dev: Cudeviceptr = 0;
+            unsafe {
+                cuerr((cuda.mem_host_get_device_ptr)(&mut ctrl_dev, raw, 0), "cuMemHostGetDevicePointer control")?;
+            }
+            ptr[slot_index(Slot::Ready)] = ctrl_dev;
+            ptr[slot_index(Slot::Done)] = ctrl_dev + 4;
+            ptr[slot_index(Slot::NWindows)] = ctrl_dev + 8;
+        }
         for s in [Slot::SpecG, Slot::E0G, Slot::E1G, Slot::E2G,
-                  Slot::FeatG, Slot::ZG, Slot::Prob, Slot::H, Slot::C]
+                  Slot::FeatG, Slot::ZG, Slot::H, Slot::C, Slot::XpadCache]
         {
             let n = slot_nelems(s);
             let mut dp: Cudeviceptr = 0;
@@ -304,9 +339,9 @@ impl VadModel {
         let mut m = VadModel {
             cuda, ctx, func, spec, ptr, slot_bytes,
             kparams: Vec::new(),
-            xpad_host,
+            xpad_host, prob_host, ctrl_host,
             context: vec![0.0; CONTEXT], _lib: lib,
-            bench: false, bench_n: 0, bench_h2d: 0, bench_launch: 0, bench_d2h: 0,
+            bench: false, bench_n: 0, bench_h2d: 0, bench_launch: 0, bench_wait: 0,
         };
         m.kparams = m.slot_bytes.iter_mut().map(|b| b.as_mut_ptr() as *mut c_void).collect();
         Ok(m)
@@ -323,58 +358,57 @@ impl VadModel {
         self.context.iter_mut().for_each(|x| *x = 0.0);
     }
 
-    /// Run the model on one 512-sample window (zero-padded if short). Mirrors
-    /// the reference `OnnxWrapper.__call__`.
-    fn forward(&mut self, window: &[f32]) -> Result<f32> {
-        // input = context[64] ++ window[512] -> reflect-pad right 64 -> xpad[640]
-        let mut xpad = [0f32; XPAD_LEN];
-        xpad[..CONTEXT].copy_from_slice(&self.context);
-        xpad[CONTEXT..INPUT_LEN].copy_from_slice(&window[..WINDOW]);
-        for i in INPUT_LEN..XPAD_LEN {
-            // np.pad right-reflect: xpad[i] = xfull[2*N - i - 2], N = INPUT_LEN
-            xpad[i] = xpad[2 * INPUT_LEN - i - 2];
-        }
-
+    fn start_persistent(&mut self, n_windows: usize) -> Result<()> {
         unsafe {
-            let bench = self.bench;
-            cuerr((self.cuda.ctx_set_current)(self.ctx), "cuCtxSetCurrent")?;
-            // zero-copy input: write xpad straight into the mapped host buffer
-            // the GPU reads (no cuMemcpyHtoD). On Tegra's unified memory this is
-            // a coherent host write the cooperative kernel sees on launch.
-            let t1 = std::time::Instant::now();
-            std::ptr::copy_nonoverlapping(xpad.as_ptr(), self.xpad_host, XPAD_LEN);
-            let t_h2d = t1.elapsed().as_nanos() as u64;
+            (&*(self.ctrl_host as *const AtomicI32)).store(0, Ordering::Relaxed);
+            (&*(self.ctrl_host.add(1) as *const AtomicI32)).store(0, Ordering::Relaxed);
+            (&*(self.ctrl_host.add(2) as *const AtomicI32)).store(n_windows as i32, Ordering::Release);
             let g = self.spec.grid;
             let b = self.spec.block;
-            let t2 = std::time::Instant::now();
             cuerr(
                 (self.cuda.launch_cooperative)(
                     self.func, g[0], g[1], g[2], b[0], b[1], b[2], self.spec.shmem,
                     std::ptr::null_mut(), self.kparams.as_mut_ptr(), std::ptr::null_mut(),
                 ),
-                "cuLaunchCooperativeKernel",
+                "cuLaunchCooperativeKernel persistent",
             )?;
+        }
+        Ok(())
+    }
+
+    /// Run the model on one 512-sample window (zero-padded if short). Mirrors
+    /// the reference `OnnxWrapper.__call__`.
+    fn forward(&mut self, window: &[f32], seq: i32) -> Result<f32> {
+        unsafe {
+            let bench = self.bench;
+            let t1 = std::time::Instant::now();
+            std::ptr::copy_nonoverlapping(self.context.as_ptr(), self.xpad_host, CONTEXT);
+            std::ptr::copy_nonoverlapping(window.as_ptr(), self.xpad_host.add(CONTEXT), WINDOW);
+            for i in 0..CONTEXT {
+                *self.xpad_host.add(INPUT_LEN + i) = window[WINDOW - 2 - i];
+            }
+            let t_h2d = t1.elapsed().as_nanos() as u64;
+            let t2 = std::time::Instant::now();
+            (&*(self.ctrl_host as *const AtomicI32)).store(seq, Ordering::Release);
             let t_launch = t2.elapsed().as_nanos() as u64;
 
-            let mut prob = [0f32; 1];
             let t3 = std::time::Instant::now();
-            cuerr(
-                (self.cuda.memcpy_d2h)(
-                    prob.as_mut_ptr() as *mut c_void,
-                    self.ptr[slot_index(Slot::Prob)],
-                    4,
-                ),
-                "cuMemcpyDtoH prob",
-            )?;
-            let t_d2h = t3.elapsed().as_nanos() as u64;
-            // cuMemcpyDtoH_v2 is synchronous (blocks until the kernel finishes +
-            // the 4-byte copy lands), so prob[0] is valid here.
+            // Tegra mapped memory is CPU/GPU coherent. The final probability
+            // store follows the last grid sync, so observing it is also the
+            // completion signal for this stateful forward pass.
+            let prob = loop {
+                if (&*(self.ctrl_host.add(1) as *const AtomicI32)).load(Ordering::Acquire) >= seq {
+                    break std::ptr::read_volatile(self.prob_host);
+                }
+                std::hint::spin_loop();
+            };
+            let t_wait = t3.elapsed().as_nanos() as u64;
             if bench {
-                self.bench_h2d += t_h2d; self.bench_launch += t_launch; self.bench_d2h += t_d2h;
+                self.bench_h2d += t_h2d; self.bench_launch += t_launch; self.bench_wait += t_wait;
             }
             // context = last 64 samples of the window
             self.context.copy_from_slice(&window[WINDOW - CONTEXT..]);
-            Ok(prob[0])
+            Ok(prob)
         }
     }
 
@@ -399,8 +433,9 @@ impl VadModel {
         let mut pos = 0usize;
         let bench = std::env::var("OTOGRAPH_VAD_BENCH").is_ok();
         self.bench = bench;
-        self.bench_n = 0; self.bench_h2d = 0; self.bench_launch = 0; self.bench_d2h = 0;
+        self.bench_n = 0; self.bench_h2d = 0; self.bench_launch = 0; self.bench_wait = 0;
         let mut times_ns: Vec<u64> = if bench { Vec::with_capacity(n_windows) } else { Vec::new() };
+        self.start_persistent(n_windows)?;
         while pos < audio_len {
             let take = (audio_len - pos).min(WINDOW);
             buf[..take].copy_from_slice(&audio[pos..pos + take]);
@@ -408,7 +443,7 @@ impl VadModel {
                 *b = 0.0;
             }
             let t0 = std::time::Instant::now();
-            let pr = self.forward(&buf)?;
+            let pr = self.forward(&buf, (probs.len() + 1) as i32)?;
             if bench {
                 times_ns.push(t0.elapsed().as_nanos() as u64);
                 self.bench_n += 1;
@@ -430,10 +465,10 @@ impl VadModel {
             );
             let n = self.bench_n.max(1) as f64;
             eprintln!(
-                "[vad-bench] phase us: h2d={:.1} launch={:.1} d2h={:.1}",
+                "[vad-bench] phase us: mapped-input={:.1} launch={:.1} mapped-output-wait={:.1}",
                 self.bench_h2d as f64 / n / 1000.0,
                 self.bench_launch as f64 / n / 1000.0,
-                self.bench_d2h as f64 / n / 1000.0,
+                self.bench_wait as f64 / n / 1000.0,
             );
         }
 
@@ -566,16 +601,23 @@ impl VadModel {
 impl Drop for VadModel {
     fn drop(&mut self) {
         unsafe {
-            // free device allocations (skip Xpad — it's a mapped host pointer,
-            // freed via cuMemFreeHost below, not cuMemFree).
+            // Mapped host pointers are freed via cuMemFreeHost, not cuMemFree.
             let xpad = self.ptr[slot_index(Slot::Xpad)];
+            let prob = self.ptr[slot_index(Slot::Prob)];
+            let ctrl = self.ptr[slot_index(Slot::Ready)];
             for &dp in &self.ptr {
-                if dp != 0 && dp != xpad {
+                if dp != 0 && dp != xpad && dp != prob && !(ctrl..ctrl + 12).contains(&dp) {
                     (self.cuda.mem_free)(dp);
                 }
             }
             if !self.xpad_host.is_null() {
                 (self.cuda.mem_free_host)(self.xpad_host as *mut c_void);
+            }
+            if !self.prob_host.is_null() {
+                (self.cuda.mem_free_host)(self.prob_host as *mut c_void);
+            }
+            if !self.ctrl_host.is_null() {
+                (self.cuda.mem_free_host)(self.ctrl_host as *mut c_void);
             }
         }
     }

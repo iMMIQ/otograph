@@ -45,7 +45,7 @@ from reference import load_weights  # noqa: E402
 KERNEL_NAME = "vad_staged"
 KERNEL_FN = K6.vad_staged
 
-# arg-name -> Slot variant (the device buffer it binds to). Covers all 24 args.
+# arg-name -> Slot variant (the device buffer it binds to).
 ARG_SLOT = {
     "xpad": "Xpad", "basis": "Basis",
     "ew0": "Ew0", "eb0": "Eb0", "ew1": "Ew1", "eb1": "Eb1",
@@ -54,6 +54,8 @@ ARG_SLOT = {
     "spec_g": "SpecG", "e0_g": "E0G", "e1_g": "E1G", "e2_g": "E2G",
     "feat_g": "FeatG", "z_g": "ZG",
     "h": "H", "c": "C", "prob": "Prob",
+    "ready": "Ready", "done": "Done", "n_windows": "NWindows",
+    "xpad_cache": "XpadCache",
 }
 
 
@@ -84,7 +86,7 @@ def main():
     # 1. compile the fused kernel -> cubin + metadata.json
     cubin = os.path.join(ASSETS, f"k_{KERNEL_NAME}.cubin")
     metapath = os.path.join(ASSETS, f"k_{KERNEL_NAME}.json")
-    tlcompile.compile_kernel(KERNEL_FN, cubin, metapath)
+    tlcompile.compile_kernel(KERNEL_FN, cubin, metapath, system_scope_atomics=True)
     meta = json.load(open(metapath))
     assert meta.get("cooperative"), "vad_staged did not mark cooperative (no sync_grid?)"
     # 2. dump weights
@@ -104,7 +106,7 @@ def main():
           "    Ew0, Ew1, Ew2, Ew3, Eb0, Eb1, Eb2, Eb3,",
           "    Wl, Rl, Lb, Fcw, Fcb,",
           "    SpecG, E0G, E1G, E2G, FeatG, ZG,",
-          "    H, C, Prob,",
+          "    H, C, Prob, Ready, Done, NWindows, XpadCache,",
           "}",
           "",
           "pub struct KSpec {",

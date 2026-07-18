@@ -29,8 +29,8 @@ VAD runs as a single compiled-in tilelang CUDA kernel (one fused cooperative
 cubin) launched through the CUDA driver (`libcuda.so`) — no ONNX Runtime or
 TensorRT. The whole forward (STFT → 4 Conv1d → LSTM cell → FC) is one
 cooperatively-launched kernel with shared-memory weight staging and grid-sync
-between stages, plus a zero-copy (mapped-memory) input. It runs FP32-accurate
-(max ~2.5e-7 vs the ONNX reference) at **~47 µs/window** (p50; min ~42 µs),
+between stages, plus zero-copy mapped input/output. It runs FP32-accurate
+(max ~2.8e-6 vs the ONNX reference) at **~19.6 µs/window** end-to-end (p50),
 down from ~70 µs for the earlier 7-kernel chain. Segments within a file are
 transcribed **concurrently** (`--concurrency`).
 
@@ -74,8 +74,9 @@ tilelang DSL as **one fused cooperative kernel**: 32 blocks, shared-memory
 weight staging per stage, and `sync_grid` barriers between stages. It is
 compiled to one standalone cubin and launched cooperatively via the CUDA driver
 API (`cuLaunchCooperativeKernel`). State (`h`, `c`) stays resident on the GPU
-and is updated in place by the kernel; the input window is zero-copy (mapped
-host memory), so there is no per-window `cuMemcpyHtoD`.
+and is updated in place by the kernel; input and probability output are mapped
+host memory, so there are no per-window CUDA copies. The cooperative kernel is
+launched once per file and persists across all stateful windows.
 
 Why one fused kernel rather than the earlier 7-kernel chain: on this Jetson the
 per-launch dispatch floor is ~5 µs even when pipelined, and CUDA-graph replay
@@ -87,12 +88,12 @@ Measured on this Jetson Orin (Rust, `OTOGRAPH_VAD_BENCH=1`):
 
 | backend                  | per window (p50) | precision vs ONNX FP32 |
 |--------------------------|-----------------:|------------------------|
-| fused cooperative (this) | **~47 µs**       | ~2.5e-7 (FP32-exact)   |
+| fused cooperative (this) | **~19.6 µs**     | max ~2.8e-6            |
 | 7-kernel chain (prev)    | ~70 µs           | ~2.5e-7                |
 | TensorRT FP16 (old)      | ~221 µs          | ~1e-3 (FP16)           |
 
-The FP32 path matches the ONNX reference ~4000× more closely than the old FP16
-path, so segment boundaries are bit-stable.
+The FP32 path matches the ONNX reference over 350× more closely than the old
+FP16 path; the reference segment boundaries remain unchanged.
 
 ## Usage
 
@@ -184,8 +185,8 @@ docker run -d --runtime=nvidia --name qwen3-asr-1.7b \
   `CUDA_ERROR_INVALID_IMAGE`.)
 - The fused kernel is launched with `cuLaunchCooperativeKernel` (it uses
   `cooperative_groups::this_grid().sync()` for the inter-stage barriers).
-- VAD inference is sequential (stateful LSTM): ~47 µs/window (p50); ~0.05 s for
-  an 11 s clip (≈1100 windows × 32 ms hop), scaling linearly. Set
+- VAD inference is sequential (stateful LSTM): ~19.6 µs/window (p50); ~0.007 s for
+  an 11 s clip (about 344 windows at a 32 ms hop), scaling linearly. Set
   `OTOGRAPH_VAD_BENCH=1` to print per-window p50/p99/min.
 - ffmpeg is invoked with raw `s16le` output (no WAV container) to avoid
   streaming-WAV header issues and parsing overhead.

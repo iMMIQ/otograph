@@ -8,7 +8,7 @@ pub enum Slot {
     Ew0, Ew1, Ew2, Ew3, Eb0, Eb1, Eb2, Eb3,
     Wl, Rl, Lb, Fcw, Fcb,
     SpecG, E0G, E1G, E2G, FeatG, ZG,
-    H, C, Prob,
+    H, C, Prob, Ready, Done, NWindows, XpadCache,
 }
 
 pub struct KSpec {
@@ -58,7 +58,7 @@ pub const WEIGHTS: &[(Slot, &[u8])] = &[
 pub const KERNELS: &[KSpec] = &[
     KSpec {
         cubin: CUBIN_VAD_STAGED, name: "vad_staged_kernel",
-        grid: [32, 1, 1], block: [128, 1, 1],
-        shmem: 17408, cooperative: true, slots: &[Slot::Lb, Slot::Rl, Slot::Wl, Slot::Basis, Slot::C, Slot::E0G, Slot::E1G, Slot::E2G, Slot::Eb0, Slot::Eb1, Slot::Eb2, Slot::Eb3, Slot::Ew0, Slot::Ew1, Slot::Ew2, Slot::Ew3, Slot::Fcb, Slot::Fcw, Slot::FeatG, Slot::H, Slot::Prob, Slot::SpecG, Slot::Xpad, Slot::ZG],
+        grid: [32, 1, 1], block: [256, 1, 1],
+        shmem: 45904, cooperative: true, slots: &[Slot::Lb, Slot::Rl, Slot::Wl, Slot::Basis, Slot::C, Slot::Done, Slot::E0G, Slot::E1G, Slot::E2G, Slot::Eb0, Slot::Eb1, Slot::Eb2, Slot::Eb3, Slot::Ew0, Slot::Ew1, Slot::Ew2, Slot::Ew3, Slot::Fcb, Slot::Fcw, Slot::FeatG, Slot::H, Slot::NWindows, Slot::Prob, Slot::Ready, Slot::SpecG, Slot::Xpad, Slot::XpadCache, Slot::ZG],
     },
 ];

@@ -6,11 +6,11 @@
     1
   ],
   "block": [
-    128,
+    256,
     1,
     1
   ],
-  "shared_mem_bytes": 17408,
+  "shared_mem_bytes": 45904,
   "cooperative": true,
   "args": [
     {
@@ -42,6 +42,12 @@
       "dtype": "float32",
       "category": "buffer",
       "nelems": 128
+    },
+    {
+      "name": "done",
+      "dtype": "int32",
+      "category": "buffer",
+      "nelems": 1
     },
     {
       "name": "e0_g",
@@ -134,8 +140,20 @@
       "nelems": 128
     },
     {
+      "name": "n_windows",
+      "dtype": "int32",
+      "category": "buffer",
+      "nelems": 1
+    },
+    {
       "name": "prob",
       "dtype": "float32",
+      "category": "buffer",
+      "nelems": 1
+    },
+    {
+      "name": "ready",
+      "dtype": "int32",
       "category": "buffer",
       "nelems": 1
     },
@@ -147,6 +165,12 @@
     },
     {
       "name": "xpad",
+      "dtype": "float32",
+      "category": "buffer",
+      "nelems": 640
+    },
+    {
+      "name": "xpad_cache",
       "dtype": "float32",
       "category": "buffer",
       "nelems": 640
