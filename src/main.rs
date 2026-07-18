@@ -1,4 +1,5 @@
 mod asr;
+mod container;
 mod ffmpeg;
 mod media;
 mod srt;
@@ -88,6 +89,66 @@ struct Cli {
     /// Discover + VAD-segment only; do not call the ASR server (prints a plan).
     #[arg(long)]
     dry_run: bool,
+
+    // --- container management (self-hosted ASR deployment) ---
+    /// Launch & manage the Qwen3-ASR vLLM container ourselves (shut it down
+    /// afterwards). Default (off) uses the already-running external server at
+    /// `--server`. Note: reuses `--container-name` (default `qwen3-asr-1.7b`),
+    /// so it removes any existing container of that name, then removes again on exit.
+    #[arg(long)]
+    serve: bool,
+
+    /// Docker image to run when --serve (the vLLM + audio-deps image).
+    #[arg(long, default_value = "qwen3-asr-vllm:audio", env = "OTOGRAPH_IMAGE")]
+    image: String,
+
+    /// Host directory holding the model files (mounted read-only into the
+    /// container at the model path).
+    #[arg(long, default_value = "/home/nvidia/model/Qwen3-ASR-1.7B", env = "OTOGRAPH_HOST_MODEL_DIR")]
+    host_model_dir: String,
+
+    /// Host base dir whose `{triton,flashinfer,torchinductor,vllm}` subdirs are
+    /// persisted as the container's JIT/compile caches (reused across runs).
+    #[arg(long, default_value = "/home/nvidia/model/vllm-cache/qwen3-asr", env = "OTOGRAPH_HOST_CACHE_DIR")]
+    host_cache_dir: String,
+
+    /// Container name (removed on exit).
+    #[arg(long, default_value = "qwen3-asr-1.7b", env = "OTOGRAPH_CONTAINER_NAME")]
+    container_name: String,
+
+    /// Host port to map to the container's 8000.
+    #[arg(long, default_value_t = 8002, env = "OTOGRAPH_HOST_PORT")]
+    host_port: u16,
+
+    /// Compute dtype for vLLM.
+    #[arg(long, default_value = "bfloat16", env = "OTOGRAPH_DTYPE")]
+    dtype: String,
+
+    /// KV cache dtype; omit to use the model's native dtype (bf16). ASR uses native.
+    #[arg(long, env = "OTOGRAPH_KV_CACHE_DTYPE")]
+    kv_cache_dtype: Option<String>,
+
+    /// gpu-memory-utilization for vLLM.
+    #[arg(long, default_value_t = 0.30, env = "OTOGRAPH_GPU_MEMORY_UTILIZATION")]
+    gpu_memory_utilization: f32,
+
+    /// max-model-len for vLLM.
+    #[arg(long, default_value_t = 8192, env = "OTOGRAPH_MAX_MODEL_LEN")]
+    max_model_len: u32,
+
+    /// max-num-seqs (vLLM admission cap); omit for the vLLM default (256).
+    #[arg(long, env = "OTOGRAPH_MAX_NUM_SEQS")]
+    max_num_seqs: Option<u32>,
+
+    /// Seconds to wait for the container to become healthy (cold start).
+    #[arg(long, default_value_t = 600, env = "OTOGRAPH_HEALTH_TIMEOUT")]
+    health_timeout: u64,
+
+    /// Cold-start attempts when --serve. vLLM v1's GPU-memory profiling races
+    /// occasionally on this Jetson's shared memory; each transient failure is
+    /// retried after tearing down the dead container. 1 = no retry.
+    #[arg(long, default_value_t = 3, env = "OTOGRAPH_SERVE_RETRIES")]
+    serve_retries: u32,
 }
 
 struct Prep {
@@ -119,6 +180,38 @@ async fn main() -> Result<()> {
     }
     eprintln!("found {} media file(s)", files.len());
 
+    // Optionally launch (and on exit tear down) the Qwen3-ASR container
+    // ourselves. `--model` doubles as the container model path + served id.
+    let spec = container::ServeSpec {
+        image: cli.image.clone(),
+        host_model_dir: cli.host_model_dir.clone(),
+        host_cache_dir: cli.host_cache_dir.clone(),
+        container_model: cli.model.clone(),
+        host_port: cli.host_port,
+        container_name: cli.container_name.clone(),
+        dtype: cli.dtype.clone(),
+        kv_cache_dtype: cli.kv_cache_dtype.clone(),
+        gpu_memory_utilization: cli.gpu_memory_utilization,
+        max_model_len: cli.max_model_len,
+        max_num_seqs: cli.max_num_seqs,
+        // ASR: graph capture is pathological (~121s) on this Jetson → always eager.
+        enforce_eager: true,
+        health_timeout: cli.health_timeout,
+        launch_retries: cli.serve_retries,
+    };
+    // Guard stays alive until the end of main → container removed after the run
+    // (and on any error via `?`, since Drop runs on unwind/return). Dry-run makes
+    // no ASR calls, so don't pay the cold start.
+    let _guard = if cli.serve && !cli.dry_run {
+        Some(container::ContainerGuard::launch(&spec).await?)
+    } else {
+        None
+    };
+    let server = _guard
+        .as_ref()
+        .map(|g| g.endpoint().to_string())
+        .unwrap_or_else(|| cli.server.clone());
+
     // Load the VAD model once; ping it across files via spawn_blocking.
     let mut model = VadModel::load(&cli.vad_model)
         .with_context(|| format!("could not load VAD model at {}", cli.vad_model.display()))?;
@@ -127,8 +220,8 @@ async fn main() -> Result<()> {
         // sanity: server reachable?
         match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build() {
             Ok(c) => {
-                if let Err(e) = c.get(format!("{}/v1/models", cli.server.trim_end_matches('/'))).send().await {
-                    eprintln!("⚠️  ASR server {} not reachable ({}); transcription will fail unless it comes up.", cli.server, e);
+                if let Err(e) = c.get(format!("{}/v1/models", server.trim_end_matches('/'))).send().await {
+                    eprintln!("⚠️  ASR server {} not reachable ({}); transcription will fail unless it comes up.", server, e);
                 }
             }
             Err(_) => {}
@@ -220,7 +313,7 @@ async fn main() -> Result<()> {
 
         // ---- transcribe segments concurrently ----
         let lang = resolve_language(&cli, media_path);
-        let asr = AsrClient::new(cli.server.clone(), cli.model.clone(), lang.clone(), cli.max_completion_tokens)?;
+        let asr = AsrClient::new(server.clone(), cli.model.clone(), lang.clone(), cli.max_completion_tokens)?;
         let texts = match transcribe_segments(&prep, asr, cli.concurrency).await {
             Ok(t) => t,
             Err(e) => {
