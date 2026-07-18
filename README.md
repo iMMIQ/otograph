@@ -5,8 +5,9 @@ what is heard into text.
 
 A small Rust CLI that walks a file or directory (recursively), extracts the audio
 from every video/audio file, splits it into speech segments with **Silero VAD**
-(running locally via ONNX Runtime), transcribes each segment with the
-**Qwen3-ASR-1.7B** vLLM server, and writes `<media>.srt` next to each source.
+(running locally as compiled tilelang CUDA kernels via `libcuda.so` — no ONNX
+Runtime / TensorRT), transcribes each segment with the **Qwen3-ASR-1.7B** vLLM
+server, and writes `<media>.srt` next to each source.
 
 The VAD segmentation logic is a faithful, line-by-line port of the official
 `silero_vad` package's `get_speech_timestamps` (verified to match the reference
@@ -15,7 +16,7 @@ to 0.01 s — see [Validation](#validation)).
 ## Pipeline
 
 ```
-media file ──ffmpeg──▶ 16 kHz mono PCM ──▶ Silero VAD (ort, CPU)
+media file ──ffmpeg──▶ 16 kHz mono PCM ──▶ Silero VAD (tilelang · GPU, libcuda)
                                               │
                             speech segments [start,end]
                                               │
@@ -24,72 +25,60 @@ media file ──ffmpeg──▶ 16 kHz mono PCM ──▶ Silero VAD (ort, CPU)
                               text + segment timestamps ──▶ <media>.srt
 ```
 
-VAD runs on CPU (it's tiny, <3 ms/s of audio); only the ASR uses the GPU, so the
-two don't contend. Segments within a file are transcribed **concurrently**
-(`--concurrency`).
+VAD runs as compiled-in tilelang CUDA kernels (7 shared-memory FP32 cubins)
+launched through the CUDA driver (`libcuda.so`) — no ONNX Runtime or TensorRT.
+It runs FP32-accurate (max ~6e-7 vs the ONNX reference, over a full file) at
+~82 us/window, faster than the previous TensorRT-FP16 path. Segments within a
+file are transcribed **concurrently** (`--concurrency`).
 
 ## Prerequisites
 
 - **ffmpeg** on PATH (any recent build).
-- **Python 3 + pip** — only used by the two download scripts (not at run time).
+- **libcuda.so** on the loader path (the CUDA driver — present on Jetson).
 - The **Qwen3-ASR-1.7B** vLLM server running (default `http://localhost:8002`).
+- Python 3 + pip + `tilelang` are **not** required to build or run — only to
+  regenerate the VAD assets (see below).
 
-## One-time setup (downloads the VAD model + ONNX Runtime)
+## Build
 
 ```bash
 cd otograph
-./scripts/download_model.sh        # -> model/silero_vad.onnx + model/silero_vad_16k.onnx
-./scripts/download_onnxruntime.sh  # -> vendor/lib/libonnxruntime.so.1.x  (≈18 MB)
 cargo build --release
 ```
 
-Both scripts pull from the aliyun pypi mirror by default (set `PIP_INDEX=...` to
-override). The onnxruntime is pinned to **1.23.2** to match the `api-23` ort
-binding in `Cargo.toml`. `download_model.sh` also runs
-`scripts/export_vad_16k.py` to produce the TensorRT-friendly fixed-sr model
-(needs `torch`); if absent, run that script manually.
+That's it. The 7 VAD cubins and the model weights are embedded
+(`assets/*.cubin`, `assets/w_*.bin`, generated into `src/vad_assets.rs`), so
+`cargo build` needs no ONNX, onnxruntime, or TensorRT. `ldd target/release/otograph`
+shows no ML runtime — `libcuda.so` is reached via `dlopen` at startup.
 
-Then, before running otograph, tell ort's `load-dynamic` where the runtime is:
+## Regenerating the VAD assets (optional, developer-only)
 
-Then, before running otograph, tell ort's `load-dynamic` where the runtime is:
-
-```bash
-export ORT_DYLIB_PATH="$PWD/vendor/lib/libonnxruntime.so"
-```
-
-(Or `export LD_LIBRARY_PATH="$PWD/vendor/lib:$LD_LIBRARY_PATH"`.)
-
-### VAD on TensorRT (Jetson Orin)
-
-VAD runs on the **TensorRT EP only** (FP16, cached engine under
-`--vad-trt-cache`) — there is no CUDA/CPU fallback, this build targets a single
-Jetson Orin. Set `ORT_DYLIB_PATH` to a GPU `onnxruntime` that ships
-`libonnxruntime_providers_tensorrt.so` (+ `..._cuda.so`) next to the main lib,
-e.g. the `onnxruntime-gpu` wheel (1.23.x matches the `api-23` binding):
+If you change the tilelang kernels (`scripts/build_vad_kernels.py` imports them
+from the sibling `../tilelang-poc/vad/kernels2.py`), rebuild the embedded
+assets from the ONNX:
 
 ```bash
-export ORT_DYLIB_PATH="$HOME/.local/lib/python3.10/site-packages/onnxruntime/capi/libonnxruntime.so.1.23.0"
+./scripts/download_model.sh     # -> model/silero_vad.onnx + model/silero_vad_16k.onnx (needs torch)
+python3 scripts/build_vad_kernels.py   # -> assets/* + src/vad_assets.rs
+cargo build --release
 ```
 
-Measured on this Jetson Orin (default `model/silero_vad_16k.onnx`):
+### VAD backend (tilelang FP32 via libcuda, Jetson Orin)
 
-| backend        | per window | 2h39m file (VAD only) |
-|----------------|-----------:|----------------------:|
-| CPU wheel      |  ~60 ms    | ~5 h (unusable)       |
-| CUDA EP        |  ~0.82 ms  | ~4 min                |
-| **TensorRT FP16** | **~0.27 ms** | **~1.4 min**      |
+The VAD forward (STFT → 4 Conv1d → LSTM cell → FC) is hand-written in the
+tilelang DSL as shared-memory-tiled FP32 dot-product kernels (no TF32), then
+compiled to standalone cubins and launched via the CUDA driver API. State
+(`h`, `c`) stays resident on the GPU and ping-pongs across windows.
 
-The first run builds the TRT engine (~24 s) and caches it; later runs reuse it.
+Measured on this Jetson Orin:
 
-#### Why a separate `silero_vad_16k.onnx`
+| backend              | per window | precision vs ONNX FP32 |
+|----------------------|-----------:|------------------------|
+| tilelang FP32 (this) | **~82 us** | ~6e-7 (FP32-exact)     |
+| TensorRT FP16 (old)  | ~221 us    | ~1e-3 (FP16)           |
 
-The stock `silero_vad.onnx` carries a sample-rate-conditional `If` (16k vs 8k
-window size) whose branches have incompatible shapes (`[128]` vs `[-1,128]`) —
-TensorRT refuses to lower it. The conditional lives only in the *outer*
-wrapper; the *inner* model is pure compute with no control flow.
-`scripts/export_vad_16k.py` traces that inner model (sr baked at 16000) to a
-drop-in ONNX (`input`/`state` → `prob`/`state_out`) that TensorRT accepts.
-otograph feeds `sr` only if the model declares it, so this model just works.
+Beyond being faster, the FP32 path matches the ONNX reference ~1600× more
+closely than the old FP16 path, so segment boundaries are bit-stable.
 
 ## Usage
 
@@ -174,18 +163,19 @@ docker run -d --runtime=nvidia --name qwen3-asr-1.7b \
 
 ## Notes (aarch64 / Jetson)
 
-- `ort` is built with `load-dynamic` + `api-23`, so it does **not** compile ONNX
-  Runtime (the default build-from-source path fails to link on Jetson — missing
-  `__cxa_call_terminate` / `__isoc23_strtoll`). The prebuilt Microsoft `.so` from
-  the onnxruntime wheel is loaded at run time via `ORT_DYLIB_PATH`.
-- VAD inference is sequential (stateful LSTM): ~0.3 s for an 11 s clip, scaling
-  linearly. For very long files it's still cheap next to the ASR.
+- The VAD talks to the GPU through the CUDA **driver** API (`libcuda.so`) via
+  `libloading`, so there is nothing to compile-link against and no ML runtime to
+  ship — `libcuda.so` is `dlopen`-ed at startup. (On this Tegra driver the cubin
+  must be loaded with `cuLibraryLoadData`; the older `cuModuleLoadData` returns
+  `CUDA_ERROR_INVALID_IMAGE`.)
+- VAD inference is sequential (stateful LSTM): ~82 us/window; ~0.08 s for an 11 s
+  clip (≈1100 windows × 32 ms hop), scaling linearly.
 - ffmpeg is invoked with raw `s16le` output (no WAV container) to avoid
   streaming-WAV header issues and parsing overhead.
 
 ## License
 
 otograph is released under the [GNU Lesser General Public License
-v3.0](LICENSE) (LGPL-3.0-or-later). The bundled/downloaded third-party
-artifacts keep their own licenses: ONNX Runtime (MIT), Silero VAD (MIT),
-ort (MIT/Apache-2.0).
+v3.0](LICENSE) (LGPL-3.0-or-later). The bundled third-party artifacts keep their
+own licenses: Silero VAD weights (MIT; the embedded cubins are our compiled
+derivative), libloading (ISC).

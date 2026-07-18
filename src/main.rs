@@ -4,6 +4,7 @@ mod ffmpeg;
 mod media;
 mod srt;
 mod vad;
+mod vad_assets;
 mod wav;
 
 use std::path::{Path, PathBuf};
@@ -44,17 +45,6 @@ struct Cli {
     /// Parse language from each filename (e.g. `talk.zh.mp4` -> zh). Overrides --language.
     #[arg(long)]
     lang_from_name: bool,
-
-    /// Path to the Silero VAD ONNX. Defaults to the fixed-16000-Hz export
-    /// (`scripts/export_vad_16k.py`), which TensorRT can lower; the stock
-    /// `silero_vad.onnx` (with its sample-rate `If`) is rejected by TensorRT.
-    #[arg(long, default_value = "model/silero_vad_16k.onnx", env = "OTOGRAPH_VAD_MODEL")]
-    vad_model: PathBuf,
-
-    /// Directory for the TensorRT engine + timing cache. First run builds the
-    /// engine; later runs reuse it.
-    #[arg(long, default_value = "vendor/trt-cache", env = "OTOGRAPH_VAD_TRT_CACHE")]
-    vad_trt_cache: PathBuf,
 
     /// Concurrency: max simultaneous ASR requests per file.
     #[arg(long, default_value_t = 8)]
@@ -220,8 +210,9 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| cli.server.clone());
 
     // Load the VAD model once; ping it across files via spawn_blocking.
-    let mut model = VadModel::load(&cli.vad_model, &cli.vad_trt_cache)
-        .with_context(|| format!("could not load VAD model at {}", cli.vad_model.display()))?;
+    // The tilelang kernels + weights are compiled in (vad_assets.rs); only
+    // libcuda.so is needed at runtime.
+    let mut model = VadModel::load().context("could not load tilelang VAD (need libcuda.so)")?;
 
     if !cli.dry_run {
         // sanity: server reachable?
