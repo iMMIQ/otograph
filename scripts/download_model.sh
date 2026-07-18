@@ -20,3 +20,15 @@ WHL="$(ls "$TMP"/silero_vad-*.whl | head -1)"
 SRC="$(find "$TMP" -name silero_vad.onnx | head -1)"
 cp "$SRC" "$OUT"
 echo "installed: $OUT ($(du -h "$OUT" | cut -f1))"
+
+# Also export the fixed-16000-Hz, TensorRT-friendly model from the torchscript
+# .jit bundled in the same wheel (needs torch). otograph defaults to this one.
+JIT="$(find "$TMP" -name silero_vad.jit | head -1)"
+OUT16="$DIR/model/silero_vad_16k.onnx"
+if [[ -s "$JIT" ]] && python3 -c 'import torch' >/dev/null 2>&1; then
+  python3 "$DIR/scripts/export_vad_16k.py" "$JIT" "$OUT16" >/dev/null
+  echo "installed: $OUT16 ($(du -h "$OUT16" | cut -f1))"
+else
+  echo "note: skipped silero_vad_16k.onnx export (no silero_vad.jit or torch); run scripts/export_vad_16k.py manually"
+fi
+

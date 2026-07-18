@@ -55,20 +55,53 @@ pub struct VadModel {
     session: Session,
     state: Array3<f32>,
     context: Array2<f32>,
+    /// True when the model declares an `sr` input (the stock `silero_vad.onnx`).
+    /// The fixed-sr export bakes sr=16000 in and omits the input, so we don't
+    /// feed it then — passing an undeclared input is a hard error in ort.
+    needs_sr: bool,
+}
+
+/// TensorRT EP: FP16, with engine + timing caches so only the first run pays
+/// the engine-build cost. `trt_cache` is the persistent cache directory.
+fn trt_provider(trt_cache: &Path) -> ort::ep::ExecutionProviderDispatch {
+    std::fs::create_dir_all(trt_cache).ok();
+    let dir = trt_cache.to_string_lossy();
+    ort::ep::TensorRT::default()
+        .with_device_id(0)
+        .with_fp16(true)
+        .with_engine_cache(true)
+        .with_engine_cache_path(&*dir)
+        .with_timing_cache(true)
+        .with_timing_cache_path(&*dir)
+        .build()
 }
 
 impl VadModel {
-    pub fn load(path: &Path) -> Result<Self> {
-        let session = Session::builder()
-            .map_err(|e| anyhow::anyhow!("ort session builder: {e}"))?
+    /// Load the VAD model on the TensorRT EP (FP16, cached engine). This is the
+    /// only supported backend on this Jetson — there is no CUDA/CPU fallback, so
+    /// a TRT init failure is a hard error. Requires a TRT-lowerable model (the
+    /// fixed-sr `silero_vad_16k.onnx`) and a GPU `libonnxruntime.so` (set
+    /// ORT_DYLIB_PATH to a build shipping `libonnxruntime_providers_tensorrt.so`).
+    pub fn load(path: &Path, trt_cache: &Path) -> Result<Self> {
+        let mut builder = Session::builder()
+            .map_err(|e| anyhow::anyhow!("ort session builder: {e}"))?;
+        builder = builder
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| anyhow::anyhow!("opt level: {e}"))?
             .with_intra_threads(1)
             .map_err(|e| anyhow::anyhow!("intra threads: {e}"))?
+            .with_execution_providers([trt_provider(trt_cache)])
+            .map_err(|e| anyhow::anyhow!("TensorRT execution provider: {e}"))?;
+
+        let session = builder
             .commit_from_file(path)
             .with_context(|| format!("loading VAD onnx {}", path.display()))?;
+
+        let needs_sr = session.inputs().iter().any(|o| o.name() == "sr");
+        eprintln!("VAD: TensorRT execution provider active");
         Ok(Self {
             session,
+            needs_sr,
             state: Array3::zeros(STATE),
             context: Array2::zeros((1, CONTEXT)),
         })
@@ -87,19 +120,23 @@ impl VadModel {
         v.extend_from_slice(self.context.as_slice().unwrap());
         v.extend_from_slice(window);
         let input = Array2::from_shape_vec((1, INPUT_LEN), v).unwrap();
-        let sr = arr0(16000i64);
 
         let input_t = Tensor::from_array(input).map_err(|e| anyhow::anyhow!("input tensor: {e}"))?;
         let state_t = Tensor::from_array(self.state.clone()).map_err(|e| anyhow::anyhow!("state tensor: {e}"))?;
-        let sr_t = Tensor::from_array(sr).map_err(|e| anyhow::anyhow!("sr tensor: {e}"))?;
+        // Built unconditionally so the borrow outlives the `run` call; only fed
+        // when the model declares `sr` (the fixed-sr export bakes it in).
+        let sr_t = Tensor::from_array(arr0(16000i64))
+            .map_err(|e| anyhow::anyhow!("sr tensor: {e}"))?;
+
+        let mut inputs: Vec<ort::session::SessionInputValue> =
+            vec![(&input_t).into(), (&state_t).into()];
+        if self.needs_sr {
+            inputs.push((&sr_t).into());
+        }
 
         let outputs = self
             .session
-            .run(ort::inputs!(
-                "input" => &input_t,
-                "state" => &state_t,
-                "sr" => &sr_t
-            ))
+            .run(&inputs[..])
             .map_err(|e| anyhow::anyhow!("ort run: {e}"))?;
 
         let prob = {

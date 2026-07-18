@@ -38,14 +38,18 @@ two don't contend. Segments within a file are transcribed **concurrently**
 
 ```bash
 cd otograph
-./scripts/download_model.sh        # -> model/silero_vad.onnx            (≈2 MB)
+./scripts/download_model.sh        # -> model/silero_vad.onnx + model/silero_vad_16k.onnx
 ./scripts/download_onnxruntime.sh  # -> vendor/lib/libonnxruntime.so.1.x  (≈18 MB)
 cargo build --release
 ```
 
 Both scripts pull from the aliyun pypi mirror by default (set `PIP_INDEX=...` to
 override). The onnxruntime is pinned to **1.23.2** to match the `api-23` ort
-binding in `Cargo.toml`.
+binding in `Cargo.toml`. `download_model.sh` also runs
+`scripts/export_vad_16k.py` to produce the TensorRT-friendly fixed-sr model
+(needs `torch`); if absent, run that script manually.
+
+Then, before running otograph, tell ort's `load-dynamic` where the runtime is:
 
 Then, before running otograph, tell ort's `load-dynamic` where the runtime is:
 
@@ -54,6 +58,38 @@ export ORT_DYLIB_PATH="$PWD/vendor/lib/libonnxruntime.so"
 ```
 
 (Or `export LD_LIBRARY_PATH="$PWD/vendor/lib:$LD_LIBRARY_PATH"`.)
+
+### VAD on TensorRT (Jetson Orin)
+
+VAD runs on the **TensorRT EP only** (FP16, cached engine under
+`--vad-trt-cache`) — there is no CUDA/CPU fallback, this build targets a single
+Jetson Orin. Set `ORT_DYLIB_PATH` to a GPU `onnxruntime` that ships
+`libonnxruntime_providers_tensorrt.so` (+ `..._cuda.so`) next to the main lib,
+e.g. the `onnxruntime-gpu` wheel (1.23.x matches the `api-23` binding):
+
+```bash
+export ORT_DYLIB_PATH="$HOME/.local/lib/python3.10/site-packages/onnxruntime/capi/libonnxruntime.so.1.23.0"
+```
+
+Measured on this Jetson Orin (default `model/silero_vad_16k.onnx`):
+
+| backend        | per window | 2h39m file (VAD only) |
+|----------------|-----------:|----------------------:|
+| CPU wheel      |  ~60 ms    | ~5 h (unusable)       |
+| CUDA EP        |  ~0.82 ms  | ~4 min                |
+| **TensorRT FP16** | **~0.27 ms** | **~1.4 min**      |
+
+The first run builds the TRT engine (~24 s) and caches it; later runs reuse it.
+
+#### Why a separate `silero_vad_16k.onnx`
+
+The stock `silero_vad.onnx` carries a sample-rate-conditional `If` (16k vs 8k
+window size) whose branches have incompatible shapes (`[128]` vs `[-1,128]`) —
+TensorRT refuses to lower it. The conditional lives only in the *outer*
+wrapper; the *inner* model is pure compute with no control flow.
+`scripts/export_vad_16k.py` traces that inner model (sr baked at 16000) to a
+drop-in ONNX (`input`/`state` → `prob`/`state_out`) that TensorRT accepts.
+otograph feeds `sr` only if the model declares it, so this model just works.
 
 ## Usage
 
