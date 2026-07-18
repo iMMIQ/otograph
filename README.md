@@ -25,11 +25,14 @@ media file ──ffmpeg──▶ 16 kHz mono PCM ──▶ Silero VAD (tilelang 
                               text + segment timestamps ──▶ <media>.srt
 ```
 
-VAD runs as compiled-in tilelang CUDA kernels (7 shared-memory FP32 cubins)
-launched through the CUDA driver (`libcuda.so`) — no ONNX Runtime or TensorRT.
-It runs FP32-accurate (max ~6e-7 vs the ONNX reference, over a full file) at
-~82 us/window, faster than the previous TensorRT-FP16 path. Segments within a
-file are transcribed **concurrently** (`--concurrency`).
+VAD runs as a single compiled-in tilelang CUDA kernel (one fused cooperative
+cubin) launched through the CUDA driver (`libcuda.so`) — no ONNX Runtime or
+TensorRT. The whole forward (STFT → 4 Conv1d → LSTM cell → FC) is one
+cooperatively-launched kernel with shared-memory weight staging and grid-sync
+between stages, plus a zero-copy (mapped-memory) input. It runs FP32-accurate
+(max ~2.5e-7 vs the ONNX reference) at **~47 µs/window** (p50; min ~42 µs),
+down from ~70 µs for the earlier 7-kernel chain. Segments within a file are
+transcribed **concurrently** (`--concurrency`).
 
 ## Prerequisites
 
@@ -46,16 +49,17 @@ cd otograph
 cargo build --release
 ```
 
-That's it. The 7 VAD cubins and the model weights are embedded
-(`assets/*.cubin`, `assets/w_*.bin`, generated into `src/vad_assets.rs`), so
+That's it. The fused VAD cubin and the model weights are embedded
+(`assets/k_vad_staged.cubin`, `assets/w_*.bin`, generated into
+`src/vad_assets.rs`), so
 `cargo build` needs no ONNX, onnxruntime, or TensorRT. `ldd target/release/otograph`
 shows no ML runtime — `libcuda.so` is reached via `dlopen` at startup.
 
 ## Regenerating the VAD assets (optional, developer-only)
 
-If you change the tilelang kernels (`scripts/build_vad_kernels.py` imports them
-from the sibling `../tilelang-poc/vad/kernels2.py`), rebuild the embedded
-assets from the ONNX:
+If you change the tilelang kernel (`scripts/build_vad_kernels.py` imports it
+from the sibling `../tilelang-poc/vad/kernels6.py: vad_staged`), rebuild the
+embedded assets from the ONNX:
 
 ```bash
 ./scripts/download_model.sh     # -> model/silero_vad.onnx + model/silero_vad_16k.onnx (needs torch)
@@ -63,22 +67,32 @@ python3 scripts/build_vad_kernels.py   # -> assets/* + src/vad_assets.rs
 cargo build --release
 ```
 
-### VAD backend (tilelang FP32 via libcuda, Jetson Orin)
+### VAD backend (fused cooperative tilelang kernel, Jetson Orin)
 
 The VAD forward (STFT → 4 Conv1d → LSTM cell → FC) is hand-written in the
-tilelang DSL as shared-memory-tiled FP32 dot-product kernels (no TF32), then
-compiled to standalone cubins and launched via the CUDA driver API. State
-(`h`, `c`) stays resident on the GPU and ping-pongs across windows.
+tilelang DSL as **one fused cooperative kernel**: 32 blocks, shared-memory
+weight staging per stage, and `sync_grid` barriers between stages. It is
+compiled to one standalone cubin and launched cooperatively via the CUDA driver
+API (`cuLaunchCooperativeKernel`). State (`h`, `c`) stays resident on the GPU
+and is updated in place by the kernel; the input window is zero-copy (mapped
+host memory), so there is no per-window `cuMemcpyHtoD`.
 
-Measured on this Jetson Orin:
+Why one fused kernel rather than the earlier 7-kernel chain: on this Jetson the
+per-launch dispatch floor is ~5 µs even when pipelined, and CUDA-graph replay
+does **not** reduce it (measured). The 7-kernel chain spent ~35 µs in dispatch
+alone; fusing to one cooperative launch collapses that while shared-mem staging
+keeps the compute fast.
 
-| backend              | per window | precision vs ONNX FP32 |
-|----------------------|-----------:|------------------------|
-| tilelang FP32 (this) | **~82 us** | ~6e-7 (FP32-exact)     |
-| TensorRT FP16 (old)  | ~221 us    | ~1e-3 (FP16)           |
+Measured on this Jetson Orin (Rust, `OTOGRAPH_VAD_BENCH=1`):
 
-Beyond being faster, the FP32 path matches the ONNX reference ~1600× more
-closely than the old FP16 path, so segment boundaries are bit-stable.
+| backend                  | per window (p50) | precision vs ONNX FP32 |
+|--------------------------|-----------------:|------------------------|
+| fused cooperative (this) | **~47 µs**       | ~2.5e-7 (FP32-exact)   |
+| 7-kernel chain (prev)    | ~70 µs           | ~2.5e-7                |
+| TensorRT FP16 (old)      | ~221 µs          | ~1e-3 (FP16)           |
+
+The FP32 path matches the ONNX reference ~4000× more closely than the old FP16
+path, so segment boundaries are bit-stable.
 
 ## Usage
 
@@ -168,8 +182,11 @@ docker run -d --runtime=nvidia --name qwen3-asr-1.7b \
   ship — `libcuda.so` is `dlopen`-ed at startup. (On this Tegra driver the cubin
   must be loaded with `cuLibraryLoadData`; the older `cuModuleLoadData` returns
   `CUDA_ERROR_INVALID_IMAGE`.)
-- VAD inference is sequential (stateful LSTM): ~82 us/window; ~0.08 s for an 11 s
-  clip (≈1100 windows × 32 ms hop), scaling linearly.
+- The fused kernel is launched with `cuLaunchCooperativeKernel` (it uses
+  `cooperative_groups::this_grid().sync()` for the inter-stage barriers).
+- VAD inference is sequential (stateful LSTM): ~47 µs/window (p50); ~0.05 s for
+  an 11 s clip (≈1100 windows × 32 ms hop), scaling linearly. Set
+  `OTOGRAPH_VAD_BENCH=1` to print per-window p50/p99/min.
 - ffmpeg is invoked with raw `s16le` output (no WAV container) to avoid
   streaming-WAV header issues and parsing overhead.
 

@@ -2,17 +2,26 @@
 """(Re)build the tilelang VAD assets embedded in otograph.
 
 Produces, relative to the otograph root:
-  assets/k_<name>.cubin   (7 compiled tilelang kernels)
-  assets/w_*.bin          (14 weight blobs extracted from the ONNX)
-  src/vad_assets.rs       (include_bytes! consts + per-kernel KSpec with slots
-                           in the cubin's ACTUAL arg order, read from each
-                           kernel's metadata.json — reorder-proof)
+  assets/k_vad_staged.cubin   (1 compiled tilelang kernel — the staged fused
+                               cooperative kernel: STFT→4 conv→LSTM→FC in one
+                               cooperatively-launched kernel with shared-mem
+                               weight staging + grid-sync between stages)
+  assets/w_*.bin              (14 weight blobs extracted from the ONNX)
+  src/vad_assets.rs           (include_bytes! consts + the KSpec with slots in
+                               the cubin's ACTUAL arg order, reorder-proof)
 
-The 7 kernels are authored in the sibling tilelang-poc/vad/ project
-(kernels2.py); this script imports them so there is one source of truth. The
-ONNX (model/silero_vad_16k.onnx) is read only for its weights.
+The fused kernel is authored in the sibling tilelang-poc/vad/ project
+(kernels6.py: vad_staged); this script imports it so there is one source of
+truth. The ONNX (model/silero_vad_16k.onnx) is read only for its weights.
 
-Output is committed; rerun this only to regenerate after changing the kernels.
+Why one fused cooperative kernel (not the 7-kernel chain): on this Jetson the
+per-kernel launch/dispatch floor is ~5us and CUDA-graph replay does NOT reduce
+it (measured: 7-kernel graph == 7 individual launches). The 7-kernel chain was
+~45us GPU-only (35us dispatch + 10us compute) / ~70us in Rust. Fusing to one
+cooperatively-launched kernel collapses the 7 dispatches into 1, and shared-mem
+staging keeps the compute at ~10us, landing ~30us kernel / ~35us Rust forward.
+
+Output is committed; rerun this only to regenerate after changing the kernel.
 """
 import json
 import os
@@ -23,40 +32,31 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ONNX = os.path.join(ROOT, "model", "silero_vad_16k.onnx")
 ASSETS = os.path.join(ROOT, "assets")
-# The tilelang kernel source lives in the sibling exploratory project.
 TLVAD = os.environ.get("OTOGRAPH_TLVAD", os.path.join(ROOT, "..", "tilelang-poc", "vad"))
 TLKERNEL = os.environ.get("OTOGRAPH_TLKERN", os.path.join(ROOT, "..", "tilelang-poc", "kernel"))
 
 sys.path.insert(0, TLVAD)
 sys.path.insert(0, TLKERNEL)
-import kernels2 as K2  # noqa: E402
+import kernels6 as K6  # noqa: E402
 import tlcompile  # noqa: E402
 from reference import load_weights  # noqa: E402
 
-# (spec name, prim_func) — order is the forward chain order.
-SPECS = [
-    ("stft2", K2.stft2),
-    ("conv0_2", K2.conv0_2),
-    ("conv1_2", K2.conv1_2),
-    ("conv2_2", K2.conv2_2),
-    ("conv3_2", K2.conv3_2),
-    ("Kz", K2.Kz),
-    ("Kgate", K2.Kgate),
-]
+# The single fused kernel.
+KERNEL_NAME = "vad_staged"
+KERNEL_FN = K6.vad_staged
 
-# per-kernel arg-name -> Slot variant (the device buffer it binds to).
+# arg-name -> Slot variant (the device buffer it binds to). Covers all 24 args.
 ARG_SLOT = {
-    "stft2":  {"xpad": "Xpad", "basis": "Basis", "spec": "Spec"},
-    "conv0_2": {"x": "Spec", "w": "Ew0", "b": "Eb0", "y": "E0"},
-    "conv1_2": {"x": "E0", "w": "Ew1", "b": "Eb1", "y": "E1"},
-    "conv2_2": {"x": "E1", "w": "Ew2", "b": "Eb2", "y": "E2"},
-    "conv3_2": {"x": "E2", "w": "Ew3", "b": "Eb3", "y": "Feat"},
-    "Kz":     {"feat": "Feat", "h": "H", "c": "C", "W": "Wl", "R": "Rl", "b": "Lb", "z": "Z"},
-    "Kgate":  {"z": "Z", "h": "H", "c": "C", "fc_w": "Fcw", "fc_b": "Fcb",
-               "prob": "Prob", "h_out": "H2", "c_out": "C2"},
+    "xpad": "Xpad", "basis": "Basis",
+    "ew0": "Ew0", "eb0": "Eb0", "ew1": "Ew1", "eb1": "Eb1",
+    "ew2": "Ew2", "eb2": "Eb2", "ew3": "Ew3", "eb3": "Eb3",
+    "Wl": "Wl", "Rl": "Rl", "Bl": "Lb", "fcw": "Fcw", "fcb": "Fcb",
+    "spec_g": "SpecG", "e0_g": "E0G", "e1_g": "E1G", "e2_g": "E2G",
+    "feat_g": "FeatG", "z_g": "ZG",
+    "h": "H", "c": "C", "prob": "Prob",
 }
 
-# weight Slot -> (filename, numpy array) — the resident buffers uploaded at load.
+
 def weight_blobs():
     W = load_weights(ONNX)
     return [
@@ -81,13 +81,12 @@ def weight_blobs():
 
 def main():
     os.makedirs(ASSETS, exist_ok=True)
-    # 1. compile 7 kernels -> cubin + metadata.json in assets/
-    metas = {}
-    for name, fn in SPECS:
-        cubin = os.path.join(ASSETS, f"k_{name}.cubin")
-        meta = os.path.join(ASSETS, f"k_{name}.json")
-        tlcompile.compile_kernel(fn, cubin, meta)
-        metas[name] = json.load(open(meta))
+    # 1. compile the fused kernel -> cubin + metadata.json
+    cubin = os.path.join(ASSETS, f"k_{KERNEL_NAME}.cubin")
+    metapath = os.path.join(ASSETS, f"k_{KERNEL_NAME}.json")
+    tlcompile.compile_kernel(KERNEL_FN, cubin, metapath)
+    meta = json.load(open(metapath))
+    assert meta.get("cooperative"), "vad_staged did not mark cooperative (no sync_grid?)"
     # 2. dump weights
     blobs = weight_blobs()
     for _, fname, arr in blobs:
@@ -96,15 +95,16 @@ def main():
 
     # 3. emit src/vad_assets.rs
     rs = ["// AUTO-GENERATED by scripts/build_vad_kernels.py — do not edit.",
-          "// 7 tilelang VAD kernels (cubins) + 14 weight blobs, with per-kernel",
-          "// launch specs whose `slots` follow the cubin's actual arg order.",
+          "// 1 fused tilelang VAD kernel (cooperative) + 14 weight blobs. The KSpec's",
+          "// `slots` follow the cubin's actual arg order (reorder-proof).",
           "",
           "#[repr(u8)] #[derive(Clone, Copy, PartialEq, Eq)]",
           "pub enum Slot {",
-          "    Xpad, Basis, Spec, E0, E1, E2, Feat, Z, Prob,",
-          "    H, C, H2, C2,",
+          "    Xpad, Basis,",
           "    Ew0, Ew1, Ew2, Ew3, Eb0, Eb1, Eb2, Eb3,",
           "    Wl, Rl, Lb, Fcw, Fcb,",
+          "    SpecG, E0G, E1G, E2G, FeatG, ZG,",
+          "    H, C, Prob,",
           "}",
           "",
           "pub struct KSpec {",
@@ -113,13 +113,12 @@ def main():
           "    pub grid: [u32; 3],",
           "    pub block: [u32; 3],",
           "    pub shmem: u32,",
+          "    pub cooperative: bool,",
           "    pub slots: &'static [Slot],",
           "}",
+          "",
+          f'pub const CUBIN_VAD_STAGED: &[u8] = include_bytes!("../assets/k_{KERNEL_NAME}.cubin");',
           ""]
-    # cubin + weight include_bytes consts
-    for name, _ in SPECS:
-        rs.append(f'pub const CUBIN_{name.upper()}: &[u8] = include_bytes!("../assets/k_{name}.cubin");')
-    rs.append("")
     for slot, fname, _ in blobs:
         rs.append(f'pub const W_{slot.upper()}: &[u8] = include_bytes!("../assets/{fname}");')
     rs.append("")
@@ -128,26 +127,22 @@ def main():
         rs.append(f"    (Slot::{slot}, W_{slot.upper()}),")
     rs.append("];")
     rs.append("")
-    # KSpec per kernel
-    spec_id = {"stft2": "STFT2", "conv0_2": "CONV0", "conv1_2": "CONV1",
-               "conv2_2": "CONV2", "conv3_2": "CONV3", "Kz": "KZ", "Kgate": "KGATE"}
+    g = (meta["grid"] + [1, 1, 1])[:3]
+    b = (meta["block"] + [1, 1, 1])[:3]
+    shmem = int(meta.get("shared_mem_bytes", 0))
+    coop = "true" if meta.get("cooperative") else "false"
+    slots = ", ".join(f"Slot::{ARG_SLOT[a['name']]}" for a in meta["args"])
     rs.append("pub const KERNELS: &[KSpec] = &[")
-    for name, _ in SPECS:
-        m = metas[name]
-        g = (m["grid"] + [1, 1, 1])[:3]
-        b = (m["block"] + [1, 1, 1])[:3]
-        shmem = int(m.get("shared_mem_bytes", 0))
-        slots = ", ".join(f"Slot::{ARG_SLOT[name][a['name']]}" for a in m["args"])
-        rs.append("    KSpec {")
-        rs.append(f'        cubin: CUBIN_{name.upper()}, name: "{m["kernel_name"]}",')
-        rs.append(f"        grid: [{g[0]}, {g[1]}, {g[2]}], block: [{b[0]}, {b[1]}, {b[2]}],")
-        rs.append(f"        shmem: {shmem}, slots: &[{slots}],")
-        rs.append("    },")
+    rs.append("    KSpec {")
+    rs.append(f'        cubin: CUBIN_VAD_STAGED, name: "{meta["kernel_name"]}",')
+    rs.append(f"        grid: [{g[0]}, {g[1]}, {g[2]}], block: [{b[0]}, {b[1]}, {b[2]}],")
+    rs.append(f"        shmem: {shmem}, cooperative: {coop}, slots: &[{slots}],")
+    rs.append("    },")
     rs.append("];")
     rs.append("")
     out = os.path.join(ROOT, "src", "vad_assets.rs")
     open(out, "w").write("\n".join(rs))
-    print(f"wrote {len(SPECS)} cubins + {len(blobs)} weights -> {ASSETS}/")
+    print(f"wrote 1 cubin (cooperative grid={g[0]}) + {len(blobs)} weights -> {ASSETS}/")
     print(f"wrote {out}")
 
 
