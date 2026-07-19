@@ -336,7 +336,15 @@ async fn main() -> Result<()> {
             })
             .collect();
 
-        srt::write_srt(&srt_path, &entries)?;
+        if let Err(e) = srt::write_srt(&srt_path, &entries) {
+            // Write can fail for per-file reasons (permissions, read-only FS,
+            // NFS hiccups over the mounted study dir, ...). Don't abort the
+            // whole batch — record it and keep going, like prep/transcribe.
+            eprintln!("❌ {}: write srt failed: {e}", media_path.display());
+            failed.push(media_path.clone());
+            pb.inc(1);
+            continue;
+        }
         let nonempty = entries.iter().filter(|e| !e.text.trim().is_empty()).count();
         eprintln!("✅ {}: {} entries -> {}", media_path.display(), nonempty, srt_path.display());
         pb.inc(1);
