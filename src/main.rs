@@ -1,6 +1,7 @@
 mod asr;
 mod container;
 mod ffmpeg;
+mod langdetect;
 mod media;
 mod srt;
 mod vad;
@@ -45,6 +46,11 @@ struct Cli {
     /// Parse language from each filename (e.g. `talk.zh.mp4` -> zh). Overrides --language.
     #[arg(long)]
     lang_from_name: bool,
+
+    /// Disable the 3-segment language probe in auto mode (restore per-segment
+    /// server auto-detect). No effect when --language or --lang-from-name is set.
+    #[arg(long, default_value_t = false)]
+    no_lang_probe: bool,
 
     /// Concurrency: max simultaneous ASR requests per file.
     #[arg(long, default_value_t = 96)]
@@ -315,9 +321,15 @@ async fn main() -> Result<()> {
         }
 
         // ---- transcribe segments concurrently ----
-        let lang = resolve_language(&cli, media_path);
+        let mut lang = resolve_language(&cli, media_path);
+        if lang.is_none() {
+            // Auto mode: probe one language for the whole file (transcribe the
+            // 3 longest segments with language=None, vote via whatlang) so every
+            // segment shares it instead of the server re-guessing per segment.
+            lang = probe_language(&prep, &server, &cli).await;
+        }
         let asr = AsrClient::new(server.clone(), cli.model.clone(), lang.clone(), cli.max_completion_tokens)?;
-        let texts = match transcribe_segments(&prep, asr, cli.concurrency).await {
+        let texts = match transcribe_segments(&prep, asr, cli.concurrency, 0..prep.segs.len()).await {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("❌ {}: transcription failed: {e}", media_path.display());
@@ -362,16 +374,21 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn transcribe_segments(
+async fn transcribe_segments<I: IntoIterator<Item = usize>>(
     prep: &Prep,
     asr: AsrClient,
     concurrency: usize,
+    idxs: I,
 ) -> Result<Vec<(usize, String)>> {
     let conc = concurrency.max(1);
     let sem = Arc::new(Semaphore::new(conc));
     let mut futs = Vec::new();
 
-    for (idx, seg) in prep.segs.iter().enumerate() {
+    for idx in idxs {
+        let seg = match prep.segs.get(idx) {
+            Some(s) => s,
+            None => continue,
+        };
         let start = seg.start;
         let end = seg.end.min(prep.samples.len());
         if end <= start {
@@ -397,4 +414,63 @@ async fn transcribe_segments(
     }
     out.sort_by_key(|(i, _)| *i);
     Ok(out)
+}
+
+/// Pick one language for the whole file by transcribing the 3 longest
+/// segments with `language=None` and voting on the resulting texts. Returns
+/// `None` on any failure or inconclusive result — the caller then falls back
+/// to per-segment server auto-detect (the previous default behaviour).
+async fn probe_language(prep: &Prep, server: &str, cli: &Cli) -> Option<String> {
+    if cli.no_lang_probe {
+        return None;
+    }
+
+    // Probe the 3 longest segments by sample count (ties broken by index).
+    let mut idxs: Vec<usize> = (0..prep.segs.len()).collect();
+    idxs.sort_by_key(|&i| std::cmp::Reverse(prep.segs[i].end - prep.segs[i].start));
+    let probe_idxs: Vec<usize> = idxs.into_iter().take(3).collect();
+
+    let probe_asr = match AsrClient::new(
+        server.to_string(),
+        cli.model.clone(),
+        None,
+        cli.max_completion_tokens,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("⚠️  lang-probe client build failed: {e}");
+            return None;
+        }
+    };
+
+    let texts = match transcribe_segments(prep, probe_asr, cli.concurrency, probe_idxs.iter().copied()).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("⚠️  lang-probe transcription failed: {e}");
+            return None;
+        }
+    };
+
+    let text_refs: Vec<&str> = texts
+        .iter()
+        .map(|(_, t)| t.as_str())
+        .filter(|t| !t.trim().is_empty())
+        .collect();
+    if text_refs.is_empty() {
+        return None;
+    }
+
+    match langdetect::detect_language_code(&text_refs) {
+        Some(code) => {
+            eprintln!(
+                "🔊 auto-lang probe: detected '{code}' from {} segment(s)",
+                text_refs.len()
+            );
+            Some(code)
+        }
+        None => {
+            eprintln!("🔊 auto-lang probe: inconclusive, falling back to per-segment auto-detect");
+            None
+        }
+    }
 }

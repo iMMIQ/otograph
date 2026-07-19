@@ -117,8 +117,9 @@ Key options (`otograph --help` for all):
 |---|---|---|
 | `--server` | `http://localhost:8002` | Qwen3-ASR base URL |
 | `--model` | `/models/Qwen3-ASR-1.7B` | served model name |
-| `--language` | *(auto)* | `zh`/`ja`/`en`/… **Pass explicitly** — server auto-detect is unreliable. |
+| `--language` | *(auto-probe)* | `zh`/`ja`/`en`/… **Pass explicitly** for best results; otherwise the 3-segment probe picks one language for the file. |
 | `--lang-from-name` | off | parse language from each filename |
+| `--no-lang-probe` | off | in auto mode, skip the probe and use server auto-detect per segment (the previous default) |
 | `--concurrency` | `96` | max simultaneous ASR requests per file; tuned with the server defaults below |
 | `--max-completion-tokens` | `200` | bounds ASR decode length |
 | `--vad-threshold` | `0.5` | speech probability threshold |
@@ -134,6 +135,14 @@ Key options (`otograph --help` for all):
 Qwen3-ASR needs an explicit `language`. For a mixed directory use
 `--lang-from-name` (parses tokens like `foo.zh.mp4`, `bar_[ja].mkv`) or split by
 language and run per-directory with `--language`.
+
+In auto mode (no `--language`, no `--lang-from-name`), `otograph` transcribes
+the 3 longest speech segments, runs text-based language detection
+([whatlang](https://crates.io/crates/whatlang)), and pins that language for
+every segment of the file — instead of letting the server re-guess per segment,
+which drifts within a single video. If the probe is inconclusive it falls back
+to per-segment server auto-detect. Pass `--no-lang-probe` to disable the probe
+and use server auto-detect for every segment (the previous default).
 
 ## Validation
 
